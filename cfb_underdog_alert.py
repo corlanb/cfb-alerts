@@ -1,10 +1,26 @@
 import os
+import time
 import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 CFBD_API_KEY = os.environ["CFBD_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
+
+
+def get_with_retries(url, params, headers, attempts=3, delay_seconds=3):
+    """CFBD's free API occasionally returns a transient 503 under heavy
+    Saturday-night load. Retry a few times before giving up on this run."""
+    last_resp = None
+    for attempt in range(1, attempts + 1):
+        resp = requests.get(url, params=params, headers=headers)
+        if resp.status_code == 200:
+            return resp
+        last_resp = resp
+        print(f"Attempt {attempt}/{attempts} failed for {url}: {resp.status_code}")
+        if attempt < attempts:
+            time.sleep(delay_seconds)
+    return last_resp
 
 
 def main():
@@ -25,7 +41,7 @@ def main():
     year = now_pt.year
 
     # 1. Get current AP Top 25 rankings
-    rankings_req = requests.get(
+    rankings_req = get_with_retries(
         "https://api.collegefootballdata.com/rankings",
         params={"year": year},
         headers=headers,
@@ -47,7 +63,7 @@ def main():
                     ranked_teams[entry["school"]] = entry["rank"]
 
     # 2. Get the live scoreboard
-    scoreboard_req = requests.get(
+    scoreboard_req = get_with_retries(
         "https://api.collegefootballdata.com/scoreboard",
         params={"classification": "fbs"},
         headers=headers,
