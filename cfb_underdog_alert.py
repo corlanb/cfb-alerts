@@ -4,20 +4,20 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-CFBD_API_KEY = os.environ["CFBD_API_KEY"]
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 
+SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard"
 
-def get_with_retries(url, params, headers, attempts=3, delay_seconds=3):
-    """CFBD's free API occasionally returns a transient 503 under heavy
-    Saturday-night load. Retry a few times before giving up on this run."""
+
+def get_with_retries(url, attempts=3, delay_seconds=3):
+    """Retry a couple of times in case the endpoint hiccups under load."""
     last_resp = None
     for attempt in range(1, attempts + 1):
-        resp = requests.get(url, params=params, headers=headers)
+        resp = requests.get(url)
         if resp.status_code == 200:
             return resp
         last_resp = resp
-        print(f"Attempt {attempt}/{attempts} failed for {url}: {resp.status_code}")
+        print(f"Attempt {attempt}/{attempts} failed: {resp.status_code}")
         if attempt < attempts:
             time.sleep(delay_seconds)
     return last_resp
@@ -37,91 +37,71 @@ def main():
         print(f"Outside Pacific game window ({now_pt}), skipping.")
         return
 
-    headers = {"Authorization": f"Bearer {CFBD_API_KEY}", "Accept": "application/json"}
-    year = now_pt.year
-
-    # 1. Get current AP Top 25 rankings
-    rankings_req = get_with_retries(
-        "https://api.collegefootballdata.com/rankings",
-        params={"year": year},
-        headers=headers,
-    )
-    if rankings_req.status_code != 200:
-        print(f"Rankings request failed ({rankings_req.status_code}): {rankings_req.text}")
-        return
-    rankings_resp = rankings_req.json()
-    if not isinstance(rankings_resp, list):
-        print(f"Unexpected rankings response: {rankings_resp}")
+    resp = get_with_retries(SCOREBOARD_URL)
+    if resp is None or resp.status_code != 200:
+        print(f"Scoreboard request failed: {resp.status_code if resp else 'no response'}")
         return
 
-    ranked_teams = {}
-    if rankings_resp:
-        latest_week = rankings_resp[-1]
-        for poll in latest_week.get("polls", []):
-            if poll.get("poll") == "AP Top 25":
-                for entry in poll.get("ranks", []):
-                    ranked_teams[entry["school"]] = entry["rank"]
-
-    # 2. Get the live scoreboard
-    scoreboard_req = get_with_retries(
-        "https://api.collegefootballdata.com/scoreboard",
-        params={"classification": "fbs"},
-        headers=headers,
-    )
-    if scoreboard_req.status_code != 200:
-        print(f"Scoreboard request failed ({scoreboard_req.status_code}): {scoreboard_req.text}")
-        return
-    games = scoreboard_req.json()
-    if not isinstance(games, list):
-        print(f"Unexpected scoreboard response: {games}")
-        return
-
+    data = resp.json()
+    events = data.get("events", [])
     alerts_sent = []
 
-    for game in games:
-        if game.get("status") != "in_progress":
+    for event in events:
+        competitions = event.get("competitions", [])
+        if not competitions:
             continue
-        period = game.get("period", 0)
+        comp = competitions[0]
+
+        status = comp.get("status", {})
+        state = status.get("type", {}).get("state")  # "pre", "in", "post"
+        if state != "in":
+            continue
+        period = status.get("period", 0)
         if period < 4:
             continue
+        clock = status.get("displayClock", "")
 
-        home = game["homeTeam"]
-        away = game["awayTeam"]
-        home_pts = home.get("points") or 0
-        away_pts = away.get("points") or 0
+        competitors = comp.get("competitors", [])
+        home = next((c for c in competitors if c.get("homeAway") == "home"), None)
+        away = next((c for c in competitors if c.get("homeAway") == "away"), None)
+        if not home or not away:
+            continue
+
+        home_pts = int(home.get("score") or 0)
+        away_pts = int(away.get("score") or 0)
         if home_pts == away_pts:
-            continue  # tied, no leader
+            continue
 
-        home_rank = ranked_teams.get(home["name"], 999)
-        away_rank = ranked_teams.get(away["name"], 999)
+        # ESPN uses 99 (or missing) to mean "unranked"
+        home_rank = home.get("curatedRank", {}).get("current", 99) or 99
+        away_rank = away.get("curatedRank", {}).get("current", 99) or 99
 
-        underdog = None
-        favorite = None
+        underdog = favorite = None
         if home_pts > away_pts and home_rank > away_rank:
             underdog, favorite = home, away
         elif away_pts > home_pts and away_rank > home_rank:
             underdog, favorite = away, home
-
         if underdog is None:
             continue
 
-        underdog_rank = ranked_teams.get(underdog["name"])
-        favorite_rank = ranked_teams.get(favorite["name"])
-        underdog_label = f"#{underdog_rank} {underdog['name']}" if underdog_rank else f"Unranked {underdog['name']}"
-        favorite_label = f"#{favorite_rank} {favorite['name']}" if favorite_rank else f"Unranked {favorite['name']}"
+        underdog_name = underdog["team"]["displayName"]
+        favorite_name = favorite["team"]["displayName"]
+        underdog_rank = underdog.get("curatedRank", {}).get("current", 99) or 99
+        favorite_rank = favorite.get("curatedRank", {}).get("current", 99) or 99
+        underdog_label = f"#{underdog_rank} {underdog_name}" if underdog_rank < 99 else f"Unranked {underdog_name}"
+        favorite_label = f"#{favorite_rank} {favorite_name}" if favorite_rank < 99 else f"Unranked {favorite_name}"
         underdog_pts = home_pts if underdog is home else away_pts
         favorite_pts = away_pts if underdog is home else home_pts
 
         message = (
             f"\U0001F6A8 **{underdog_label}** ({underdog_pts}) is leading "
-            f"**{favorite_label}** ({favorite_pts}) in Q{period}, "
-            f"{game.get('clock', '')} left!"
+            f"**{favorite_label}** ({favorite_pts}) in Q{period}, {clock} left!"
         )
 
         requests.post(DISCORD_WEBHOOK_URL, json={"content": message})
         alerts_sent.append(message)
 
-    print(f"Games checked: {len(games)}. Alerts sent: {len(alerts_sent)}")
+    print(f"Games checked: {len(events)}. Alerts sent: {len(alerts_sent)}")
 
 
 if __name__ == "__main__":
